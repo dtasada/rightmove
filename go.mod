@@ -3,12 +3,12 @@ module rightmove-scraper
 go 1.24.5
 
 require (
+	github.com/PuerkitoBio/goquery v1.10.3
 	github.com/goccy/go-yaml v1.18.0
 	github.com/gocolly/colly v1.2.0
 )
 
 require (
-	github.com/PuerkitoBio/goquery v1.10.3 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/antchfx/htmlquery v1.3.4 // indirect
 	github.com/antchfx/xmlquery v1.4.4 // indirect

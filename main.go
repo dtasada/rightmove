@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/goccy/go-yaml"
@@ -78,9 +80,27 @@ func genUrl(index uint32) string {
 func createCollector() *colly.Collector {
 	c := colly.NewCollector()
 
-	// c.OnRequest(func(r *colly.Request) { r.Headers.Set("User-Agent", userAgentList[rand.Intn(len(userAgentList))]) })
-	c.OnError(func(_ *colly.Response, err error) { log.Panicln("Something went wrong:", err) })
-	// c.OnResponse(func(r *colly.Response) {})
+	// Enable user agent rotation to appear more like real browsers
+	c.OnRequest(func(r *colly.Request) {
+		r.Headers.Set("User-Agent", userAgentList[rand.Intn(len(userAgentList))])
+		// Add a random delay between requests (1-3 seconds)
+		time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+	})
+
+	// Better error handling - don't panic on rate limits
+	c.OnError(func(resp *colly.Response, err error) {
+		if resp != nil && resp.StatusCode == 429 {
+			log.Println("Rate limited (429). Waiting 10 seconds before continuing...")
+			time.Sleep(10 * time.Second)
+		} else {
+			log.Println("Request failed:", err)
+		}
+	})
+
+	// Optional: Log successful responses
+	c.OnResponse(func(r *colly.Response) {
+		log.Printf("Visited: %s (Status: %d)\n", r.Request.URL, r.StatusCode)
+	})
 
 	return c
 }
@@ -115,7 +135,9 @@ func getPropertyCount() {
 }
 
 func findProperties(startingIndex uint32, propertyUrls chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
+	if wg != nil {
+		defer wg.Done()
+	}
 	c := createCollector()
 	index := startingIndex
 
@@ -157,6 +179,7 @@ func filterProperties(filteredProperties chan string, propertyUrls <-chan string
 	}
 
 	visitWg.Wait()
+	log.Printf("Filter worker finished processing all property URLs")
 }
 
 func getMetadataFromProperties(propertyMetadata chan Property, filteredProperties <-chan string, wg *sync.WaitGroup) {
@@ -239,34 +262,57 @@ func main() {
 	setMetadata()
 	getPropertyCount()
 
-	var wg sync.WaitGroup
 	propertyUrls := make(chan string, pageCount)
 	filteredProperties := make(chan string, propertyResultCount)
 	propertyMetadata := make(chan Property, propertyResultCount)
 
-	for range propertyResultCount {
-		wg.Add(1)
-		go getMetadataFromProperties(propertyMetadata, filteredProperties, &wg)
+	// Limit concurrent workers to reduce load on Rightmove
+	maxWorkers := min(3, int(propertyResultCount))
+
+	var filterWg sync.WaitGroup
+	var metaWg sync.WaitGroup
+
+	// Limited concurrent filter workers
+	for i := 0; i < maxWorkers; i++ {
+		filterWg.Add(1)
+		go filterProperties(filteredProperties, propertyUrls, &filterWg)
 	}
 
-	for range propertyResultCount {
-		wg.Add(1)
-		go filterProperties(filteredProperties, propertyUrls, &wg)
+	// Limited concurrent metadata workers
+	for range maxWorkers {
+		metaWg.Add(1)
+		go getMetadataFromProperties(propertyMetadata, filteredProperties, &metaWg)
 	}
 
-	for i := range pageCount {
-		wg.Add(1)
-		go findProperties(i*pageLength, propertyUrls, &wg)
-	}
-
+	// Process pages sequentially to avoid overwhelming the server
 	go func() {
-		wg.Wait()
+		for i := range pageCount {
+			findProperties(i*pageLength, propertyUrls, nil)
+			// Add delay between pages
+			time.Sleep(2 * time.Second)
+		}
 		close(propertyUrls)
-		close(filteredProperties)
-		close(propertyMetadata)
+		log.Println("Finished processing all pages, closed propertyUrls channel")
 	}()
 
+	// Close filteredProperties after all filter workers finish
+	go func() {
+		filterWg.Wait()
+		close(filteredProperties)
+		log.Println("All filter workers finished, closed filteredProperties channel")
+	}()
+
+	// Close propertyMetadata after all metadata workers finish
+	go func() {
+		metaWg.Wait()
+		close(propertyMetadata)
+		log.Println("All metadata workers finished, closed propertyMetadata channel")
+	}()
+
+	// Collect and display results
 	for result := range filteredProperties {
 		fmt.Println("Filtered property:", result)
 	}
+
+	log.Println("Scraping completed successfully!")
 }
