@@ -90,16 +90,16 @@ func createCollector() *colly.Collector {
 	// Better error handling - don't panic on rate limits
 	c.OnError(func(resp *colly.Response, err error) {
 		if resp != nil && resp.StatusCode == 429 {
-			log.Printf("Rate limited (429). Waiting 10 seconds before continuing...")
+			log.Printf("Rate limited (429). Waiting 10 seconds before continuing...\n")
 			time.Sleep(10 * time.Second)
 		} else {
-			log.Printf("Request failed: %v", err)
+			log.Printf("Request failed: %v\n", err)
 		}
 	})
 
 	// Optional: Log successful responses
 	c.OnResponse(func(r *colly.Response) {
-		log.Printf("Visited: %s (Status: %d)", r.Request.URL, r.StatusCode)
+		log.Printf("Visited: %s (Status: %d)\n", r.Request.URL, r.StatusCode)
 	})
 
 	return c
@@ -292,21 +292,21 @@ func main() {
 			time.Sleep(2 * time.Second)
 		}
 		close(propertyUrls)
-		log.Printf("Finished processing all pages, closed propertyUrls channel")
+		log.Println("Finished processing all pages, closed propertyUrls channel")
 	}()
 
 	// Close filteredProperties after all filter workers finish
 	go func() {
 		filterWg.Wait()
 		close(filteredProperties)
-		log.Printf("All filter workers finished, closed filteredProperties channel")
+		log.Println("All filter workers finished, closed filteredProperties channel")
 	}()
 
 	// Close propertyMetadata after all metadata workers finish
 	go func() {
 		metaWg.Wait()
 		close(propertyMetadata)
-		log.Printf("All metadata workers finished, closed propertyMetadata channel")
+		log.Println("All metadata workers finished, closed propertyMetadata channel")
 	}()
 
 	// Collect and display results
