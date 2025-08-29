@@ -20,6 +20,7 @@ import (
 const (
 	pageLength uint32 = 24
 	rootUrl    string = "https://www.rightmove.co.uk"
+	askAgent   string = "Ask agent"
 )
 
 var (
@@ -120,14 +121,23 @@ func getPropertyCount() {
 
 	c.OnHTML(".Pagination_pageSelectContainer__zt0rg", func(e *colly.HTMLElement) {
 		e.DOM.Find("span").Each(func(i int, s *goquery.Selection) {
-			if s.Text() == "Page " {
+			text := s.Text()
+			if text == "Page " {
 				return
 			}
-			pageCount_, err := strconv.Atoi(strings.Split(s.Text(), " ")[1]) // this is not a space. this is ASCII 160
-			if err != nil {
-				log.Fatalln("Could not strconv.Atoi property result count: ", err)
+			// Handle format like "of 16" with non-breaking space (U+00A0)
+			if after, ok := strings.CutPrefix(text, "of\u00a0"); ok {
+				pageCountText := after
+				pageCountValue, err := strconv.Atoi(pageCountText)
+				if err != nil {
+					log.Printf("Could not parse page count from 'of %s', error: %v", pageCountText, err)
+					return
+				}
+				pageCount = uint32(pageCountValue)
+				log.Printf("Found %d total pages", pageCount)
+				return
 			}
-			pageCount = uint32(pageCount_)
+			log.Printf("Unhandled pagination text: '%s'", text)
 		})
 	})
 
@@ -161,6 +171,10 @@ func filterProperties(filteredProperties chan string, propertyUrls <-chan string
 	var visitWg sync.WaitGroup
 
 	c := createCollector()
+	// Ensure we decrement visitWg on failures too
+	c.OnError(func(r *colly.Response, err error) {
+		visitWg.Done()
+	})
 	c.OnHTML(".STw8udCxUaBUMfOOZu0iL._3nPVwR0HZYQah5tkVJHFh5", func(e *colly.HTMLElement) {
 		for _, kw := range config.Keywords {
 			if strings.Contains(e.Text, kw) {
@@ -175,7 +189,10 @@ func filterProperties(filteredProperties chan string, propertyUrls <-chan string
 	for propertyUrl := range propertyUrls {
 		fullPropertyUrl := rootUrl + propertyUrl
 		visitWg.Add(1)
-		c.Visit(fullPropertyUrl)
+		if err := c.Visit(fullPropertyUrl); err != nil {
+			// e.g., ErrAlreadyVisited – callbacks won't fire, so decrement here
+			visitWg.Done()
+		}
 	}
 
 	visitWg.Wait()
@@ -187,6 +204,10 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 	var getDataWg sync.WaitGroup
 
 	c := createCollector()
+	// Ensure we decrement getDataWg on failures too
+	c.OnError(func(r *colly.Response, err error) {
+		getDataWg.Done()
+	})
 	c.OnHTML(".WJG_W7faYk84nW-6sCBVi", func(e *colly.HTMLElement) {
 		var p Property
 		p.Url = e.Request.URL.String()
@@ -198,24 +219,51 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 			case 0:
 				p.PropertyType = s.Text()
 			case 1:
-				beds, err := strconv.Atoi(s.Text())
-				if err != nil {
-					log.Fatalln("Couldn't convert Bedrooms to number: ", err)
+				bedsText := s.Text()
+				if bedsText == askAgent {
+					// Expected case where bedrooms info is not available
+					p.Beds = 0
+				} else {
+					beds, err := strconv.Atoi(bedsText)
+					if err != nil {
+						log.Printf("Could not parse bedrooms - received value: '%s', error: %v, setting to 0", bedsText, err)
+						p.Beds = 0
+					} else {
+						p.Beds = beds
+					}
 				}
-				p.Beds = beds
 			case 2:
-				baths, err := strconv.Atoi(s.Text())
-				if err != nil {
-					log.Fatalln("Couldn't convert Bathrooms to number: ", err)
+				bathsText := s.Text()
+				if bathsText == askAgent {
+					// Expected case where bathrooms info is not available
+					p.Baths = 0
+				} else {
+					baths, err := strconv.Atoi(bathsText)
+					if err != nil {
+						log.Printf("Could not parse bathrooms - received value: '%s', error: %v, setting to 0", bathsText, err)
+						p.Baths = 0
+					} else {
+						p.Baths = baths
+					}
 				}
-				p.Baths = baths
 			case 3:
-				size_string := s.Parent().Children().Last().Text()
-				size, err := strconv.Atoi(strings.Split(size_string, " sq m")[0])
-				if err != nil {
-					log.Fatalln("Couldn't convert surface area to number: ", err)
+				sizeString := s.Parent().Children().Last().Text()
+				if strings.Contains(sizeString, " sq m") {
+					sizeText := strings.Split(sizeString, " sq m")[0]
+					size, err := strconv.Atoi(sizeText)
+					if err != nil {
+						log.Printf("Could not parse surface area - raw value: '%s', extracted: '%s', error: %v, setting to 0", sizeString, sizeText, err)
+						p.Size = 0
+					} else {
+						p.Size = size
+					}
+				} else if sizeString == askAgent {
+					// Expected cases where size is not available
+					p.Size = 0
+				} else {
+					log.Printf("Surface area in unexpected format - received value: '%s', setting to 0", sizeString)
+					p.Size = 0
 				}
-				p.Size = size
 			case 4:
 				p.Tenure = s.Text()
 			}
@@ -228,7 +276,10 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 
 	for propertyUrl := range filteredProperties {
 		getDataWg.Add(1)
-		c.Visit(propertyUrl)
+		if err := c.Visit(propertyUrl); err != nil {
+			// e.g., ErrAlreadyVisited – callbacks won't fire, so decrement here
+			getDataWg.Done()
+		}
 	}
 
 	getDataWg.Wait()
@@ -251,11 +302,11 @@ func setMetadata() {
 }
 
 func main() {
-	config_file, err := os.ReadFile("config.yaml")
+	configFile, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("Could not read config.yaml: %v\n", err)
 	}
-	if err := yaml.Unmarshal(config_file, &config); err != nil {
+	if err := yaml.Unmarshal(configFile, &config); err != nil {
 		log.Fatalf("Could not parse config.yaml: %v\n", err)
 	}
 
@@ -265,6 +316,7 @@ func main() {
 	propertyUrls := make(chan string, pageCount)
 	filteredProperties := make(chan string, propertyResultCount)
 	propertyMetadata := make(chan Property, propertyResultCount)
+	metaDone := make(chan struct{})
 
 	// Limit concurrent workers to reduce load on Rightmove
 	maxWorkers := min(3, int(propertyResultCount))
@@ -307,12 +359,16 @@ func main() {
 		metaWg.Wait()
 		close(propertyMetadata)
 		log.Println("All metadata workers finished, closed propertyMetadata channel")
+		close(metaDone)
 	}()
 
 	// Collect and display results
 	for result := range filteredProperties {
 		fmt.Println("Filtered property:", result)
 	}
+
+	// Ensure metadata workers have finished too
+	<-metaDone
 
 	log.Println("Scraping completed successfully!")
 }
