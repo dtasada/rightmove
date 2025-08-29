@@ -26,6 +26,7 @@ const (
 var (
 	propertyResultCount uint32
 	pageCount           uint32
+	progressBar         *ProgressBar
 	userAgentList       = []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/93.0.4577.82 Safari/537.36",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36 Edg/87.0.664.75",
@@ -55,6 +56,8 @@ type Property struct {
 	Tenure       string
 	Price        int
 }
+
+// ProgressBar implementation moved to progress_bar.go
 
 func genUrl(index uint32) string {
 	return rootUrl +
@@ -134,7 +137,7 @@ func getPropertyCount() {
 					return
 				}
 				pageCount = uint32(pageCountValue)
-				log.Printf("Found %d total pages", pageCount)
+				log.Printf("Found %d total results across %d pages", propertyResultCount, pageCount)
 				return
 			}
 			log.Printf("Unhandled pagination text: '%s'", text)
@@ -173,6 +176,9 @@ func filterProperties(filteredProperties chan string, propertyUrls <-chan string
 	c := createCollector()
 	// Ensure we decrement visitWg on failures too
 	c.OnError(func(r *colly.Response, err error) {
+		if progressBar != nil {
+			progressBar.Increment()
+		}
 		visitWg.Done()
 	})
 	c.OnHTML(".STw8udCxUaBUMfOOZu0iL._3nPVwR0HZYQah5tkVJHFh5", func(e *colly.HTMLElement) {
@@ -184,13 +190,21 @@ func filterProperties(filteredProperties chan string, propertyUrls <-chan string
 		}
 	})
 
-	c.OnResponse(func(r *colly.Response) { visitWg.Done() })
+	c.OnResponse(func(r *colly.Response) {
+		if progressBar != nil {
+			progressBar.Increment()
+		}
+		visitWg.Done()
+	})
 
 	for propertyUrl := range propertyUrls {
 		fullPropertyUrl := rootUrl + propertyUrl
 		visitWg.Add(1)
 		if err := c.Visit(fullPropertyUrl); err != nil {
 			// e.g., ErrAlreadyVisited – callbacks won't fire, so decrement here
+			if progressBar != nil {
+				progressBar.Increment()
+			}
 			visitWg.Done()
 		}
 	}
@@ -302,6 +316,17 @@ func setMetadata() {
 }
 
 func main() {
+	// Initialize logging to file (reset on each execution)
+	logFile, err := os.Create("scraper.log")
+	if err != nil {
+		// If we cannot create the log file, fall back to default output
+		fmt.Fprintf(os.Stderr, "Could not create scraper.log: %v\n", err)
+	} else {
+		log.SetOutput(logFile)
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		defer logFile.Close()
+	}
+
 	configFile, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Fatalf("Could not read config.yaml: %v\n", err)
@@ -310,16 +335,33 @@ func main() {
 		log.Fatalf("Could not parse config.yaml: %v\n", err)
 	}
 
+	// Print a concise bullet list of the search conditions to stdout
+	fmt.Println()
+	fmt.Println("Search:")
+	fmt.Printf("- zip: %s\n", config.ZipCode)
+	fmt.Printf("- radius: %.1fmi\n", config.Radius)
+	fmt.Printf("- minBeds: %d\n", config.MinBedrooms)
+	fmt.Printf("- keywords: %s\n", strings.Join(config.Keywords, ", "))
+	fmt.Println()
+
 	setMetadata()
 	getPropertyCount()
 
-	propertyUrls := make(chan string, pageCount)
-	filteredProperties := make(chan string, propertyResultCount)
-	propertyMetadata := make(chan Property, propertyResultCount)
+	// Announce start before showing the progress bar, including results count
+	fmt.Printf("Found %d results: Scrapping RightMove Content...\n", propertyResultCount)
+	fmt.Println()
+
+	// Initialize progress bar with total equal to number of properties
+	progressBar = NewProgressBar(propertyResultCount)
+	progressBar.Draw()
+
+	propertyUrls := make(chan string, int(pageCount))
+	filteredProperties := make(chan string, int(propertyResultCount))
+	propertyMetadata := make(chan Property, int(propertyResultCount))
 	metaDone := make(chan struct{})
 
 	// Limit concurrent workers to reduce load on Rightmove
-	maxWorkers := min(3, int(propertyResultCount))
+	maxWorkers := intMin(3, int(propertyResultCount))
 
 	var filterWg sync.WaitGroup
 	var metaWg sync.WaitGroup
@@ -331,14 +373,14 @@ func main() {
 	}
 
 	// Limited concurrent metadata workers
-	for range maxWorkers {
+	for i := 0; i < maxWorkers; i++ {
 		metaWg.Add(1)
 		go getMetadataFromProperties(propertyMetadata, filteredProperties, &metaWg)
 	}
 
 	// Process pages sequentially to avoid overwhelming the server
 	go func() {
-		for i := range pageCount {
+		for i := uint32(0); i < pageCount; i++ {
 			findProperties(i*pageLength, propertyUrls, nil)
 			// Add delay between pages
 			time.Sleep(2 * time.Second)
@@ -362,13 +404,20 @@ func main() {
 		close(metaDone)
 	}()
 
-	// Collect and display results
+	// Collect results (log to file)
 	for result := range filteredProperties {
-		fmt.Println("Filtered property:", result)
+		log.Println("Filtered property:", result)
 	}
 
 	// Ensure metadata workers have finished too
 	<-metaDone
 
 	log.Println("Scraping completed successfully!")
+}
+
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

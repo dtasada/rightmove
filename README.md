@@ -56,7 +56,7 @@ keywords:               # Properties must contain at least one of these keywords
 ### Option 1: Run directly (recommended for development)
 
 ```bash
-go run main.go
+go run .
 ```
 
 ### Option 2: Compile and run
@@ -158,6 +158,13 @@ rightmove/
 
 4. **No results found**:
    **Solution**: Try broadening your search criteria (increase radius, reduce minimum bedrooms, or modify keywords)
+
+5. **Build/run errors like `undefined: ProgressBar` or helpers**:
+   ```
+   # command-line-arguments
+   ./main.go:XX: undefined: ProgressBar
+   ```
+   **Solution**: Use `go run .` or `go build` instead of `go run main.go`. The code spans multiple files; running a single file excludes the rest.
 
 ## License
 
