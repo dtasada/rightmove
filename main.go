@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,15 +406,61 @@ func main() {
 		close(metaDone)
 	}()
 
-	// Collect results (log to file)
-	for result := range filteredProperties {
-		log.Println("Filtered property:", result)
+	// Collect metadata entries into memory
+	var properties []Property
+	for p := range propertyMetadata {
+		properties = append(properties, p)
 	}
 
-	// Ensure metadata workers have finished too
-	<-metaDone
+	// Write to CSV after scraping completes
+	csvPath := "results.csv"
+	if err := writeCSV(csvPath, properties); err != nil {
+		log.Fatalf("Failed to write CSV: %v", err)
+	}
 
-	log.Println("Scraping completed successfully!")
+	log.Println("Scraping completed successfully! Results saved to results.csv")
+
+	// Inform user via stdout where the CSV is located
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("\nResults CSV: %s\n", csvPath)
+	} else {
+		fmt.Printf("\nResults CSV: %s\n", filepath.Join(cwd, csvPath))
+	}
+}
+
+func writeCSV(path string, properties []Property) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	defer w.Flush()
+
+	if err := w.Write([]string{"url", "street", "propertyType", "beds", "baths", "size", "tenure", "price"}); err != nil {
+		return err
+	}
+
+	for _, p := range properties {
+		record := []string{
+			p.Url,
+			p.Street,
+			p.PropertyType,
+			strconv.Itoa(p.Beds),
+			strconv.Itoa(p.Baths),
+			strconv.Itoa(p.Size),
+			p.Tenure,
+			strconv.Itoa(p.Price),
+		}
+		if err := w.Write(record); err != nil {
+			return err
+		}
+	}
+
+	w.Flush()
+	return w.Error()
 }
 
 func intMin(a, b int) int {
