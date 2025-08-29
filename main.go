@@ -90,10 +90,10 @@ func createCollector() *colly.Collector {
 	// Better error handling - don't panic on rate limits
 	c.OnError(func(resp *colly.Response, err error) {
 		if resp != nil && resp.StatusCode == 429 {
-			log.Printf("Rate limited (429). Waiting 10 seconds before continuing...\n")
+			log.Println("Rate limited (429). Waiting 10 seconds before continuing...")
 			time.Sleep(10 * time.Second)
 		} else {
-			log.Printf("Request failed: %v\n", err)
+			log.Println("Request failed:", err)
 		}
 	})
 
@@ -314,5 +314,5 @@ func main() {
 		fmt.Println("Filtered property:", result)
 	}
 
-	log.Printf("Scraping completed successfully!")
+	log.Println("Scraping completed successfully!")
 }
