@@ -285,6 +285,16 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 			}
 		})
 
+		// Price extraction with robust fallbacks
+		priceText := strings.TrimSpace(e.DOM.Find("div._1gfnqJ3Vtd1z40MlC0MzXu").Find("span").First().Text())
+		if priceText == "" {
+			priceText = strings.TrimSpace(e.DOM.Find("div._1gfnqJ3Vtd1z40MlC0MzXu").First().Text())
+		}
+		if priceText == "" {
+			priceText = strings.TrimSpace(e.DOM.Find("article._2fFy6nQs_hX4a6WEDR-B-6 div._1gfnqJ3Vtd1z40MlC0MzXu").First().Text())
+		}
+		p.Price = parsePrice(priceText)
+
 		propertyMetadata <- p
 	})
 
@@ -468,4 +478,32 @@ func intMin(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// parsePrice converts a currency string like "£325,000" or "Guide Price £325,000" into an integer 325000.
+func parsePrice(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" || text == askAgent {
+		return 0
+	}
+
+	var digits strings.Builder
+	for _, r := range text {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+
+	if digits.Len() == 0 {
+		return 0
+	}
+
+	valueString := digits.String()
+	value, err := strconv.Atoi(valueString)
+	if err != nil {
+		log.Printf("Could not parse price - raw value: '%s', extracted: '%s', error: %v, setting to 0", text, valueString, err)
+		return 0
+	}
+
+	return value
 }
