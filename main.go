@@ -11,19 +11,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/goccy/go-yaml"
-	"github.com/gocolly/colly"
 )
 
 const (
-	pageLength   uint32 = 24
-	rootUrl      string = "https://www.rightmove.co.uk"
-	askAgent     string = "Ask agent"
-	askDeveloper string = "Ask developer"
+	pageLength uint32 = 24
+	rootUrl    string = "https://www.rightmove.co.uk"
 )
 
 var (
@@ -60,282 +55,72 @@ type Property struct {
 	Price        int
 }
 
-// ProgressBar implementation moved to progress_bar.go
+// Search "Self contained flat" in the description
 
+// genSearchUrl generates the Rightmove API search URL.
 func genUrl(index uint32) string {
 	return rootUrl +
-		"/property-for-sale/" +
-		"find.html" +
+		"/api/property-search/listing/search" +
 		fmt.Sprintf("?searchLocation=%s", arguments.zipCodeUrl) +
 		"&useLocationIdentifier=true" +
 		fmt.Sprintf("&locationIdentifier=POSTCODE%%5E%s", arguments.postCodeId) +
-		"&buy=For+sale" +
 		fmt.Sprintf("&radius=%.1f", config.Radius) +
 		fmt.Sprintf("&minBedrooms=%d", config.MinBedrooms) +
-		"&propertyTypes=flat%2Cdetached%2Csemi-detached%2Cterraced%2Cbungalow%2Cland%2Cpark-home" +
 		"&_includeSSTC=on" +
 		"&includeSSTC=true" +
 		fmt.Sprintf("&index=%d", index) +
 		"&sortType=2" +
 		"&channel=BUY" +
 		"&transactionType=BUY" +
-		"&displayLocationIdentifier=undefined" +
-		"&tenureTypes=FREEHOLD"
-
-}
-
-func createCollector() *colly.Collector {
-	c := colly.NewCollector()
-
-	// Enable user agent rotation to appear more like real browsers
-	c.OnRequest(func(r *colly.Request) {
-		r.Headers.Set("User-Agent", userAgentList[rand.Intn(len(userAgentList))])
-		// Add a random delay between requests (1-3 seconds)
-		time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
-	})
-
-	// Better error handling - don't panic on rate limits
-	c.OnError(func(resp *colly.Response, err error) {
-		if resp != nil && resp.StatusCode == 429 {
-			log.Println("Rate limited (429). Waiting 10 seconds before continuing...")
-			time.Sleep(10 * time.Second)
-		} else {
-			log.Println("Request failed:", err)
-		}
-	})
-
-	// Optional: Log successful responses
-	c.OnResponse(func(r *colly.Response) {
-		log.Printf("Visited: %s (Status: %d)\n", r.Request.URL, r.StatusCode)
-	})
-
-	return c
+		"&displayLocationIdentifier=undefined"
 }
 
 func getPropertyCount() {
-	c := createCollector()
-
-	c.OnHTML(".ResultsCount_resultsCount__Kqeah", func(e *colly.HTMLElement) {
-		e.DOM.Find("span").Each(func(i int, s *goquery.Selection) {
-			resultCount, err := strconv.Atoi(s.Text())
-			if err != nil {
-				log.Fatalln("Could not strconv.Atoi property result count: ", err)
-			}
-			propertyResultCount = uint32(resultCount)
-		})
-	})
-
-	c.OnHTML(".Pagination_pageSelectContainer__zt0rg", func(e *colly.HTMLElement) {
-		e.DOM.Find("span").Each(func(i int, s *goquery.Selection) {
-			text := s.Text()
-			if text == "Page " {
-				return
-			}
-			// Handle format like "of 16" with non-breaking space (U+00A0)
-			if after, ok := strings.CutPrefix(text, "of\u00a0"); ok {
-				pageCountText := after
-				pageCountValue, err := strconv.Atoi(pageCountText)
-				if err != nil {
-					log.Printf("Could not parse page count from 'of %s', error: %v, url: %s", pageCountText, err, e.Request.URL.String())
-					return
-				}
-				pageCount = uint32(pageCountValue)
-				log.Printf("Found %d total results across %d pages", propertyResultCount, pageCount)
-				return
-			}
-			log.Printf("Unhandled pagination text: '%s'", text)
-		})
-	})
-
-	c.Visit(genUrl(0))
-}
-
-func findProperties(startingIndex uint32, propertyUrls chan string, wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+	req, err := http.NewRequest("GET", genUrl(0), nil)
+	if err != nil {
+		log.Printf("Failed to create request: %v", err)
+		return
 	}
-	c := createCollector()
-	index := startingIndex
+	req.Header.Set("User-Agent", userAgentList[rand.Intn(len(userAgentList))])
+	req.Header.Set("Accept", "application/json, text/plain, */*")
 
-	c.OnHTML("#l-searchResults", func(e *colly.HTMLElement) {
-		e.DOM.Find("[class=propertyCard-link]").Each(func(i int, s *goquery.Selection) {
-			propertyUrl, _ := s.Attr("href")
-			propertyUrls <- propertyUrl
-			index++
-		})
-	})
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to fetch property count: %v", err)
+		return
+	}
+	defer resp.Body.Close()
 
-	c.OnScraped(func(r *colly.Response) {
-		// log.Printf("Processed page %d/%d (%d properties). Moving on...\n", index/pageLength, pageCount, pageLength)
-	})
+	var payload struct {
+		ResultCount string `json:"resultCount"`
+		Pagination  struct {
+			Total   int `json:"total"`
+			Options []struct {
+				Value string `json:"value"`
+			} `json:"options"`
+		} `json:"pagination"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		log.Printf("Could not parse search JSON: %v", err)
+		return
+	}
 
-	c.Visit(genUrl(index))
-}
-
-func filterProperties(filteredProperties chan string, propertyUrls <-chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	var visitWg sync.WaitGroup
-
-	c := createCollector()
-	// Ensure we decrement visitWg on failures too
-	c.OnError(func(r *colly.Response, err error) {
-		if progressBar != nil {
-			progressBar.Increment()
-		}
-		visitWg.Done()
-	})
-	c.OnHTML(".STw8udCxUaBUMfOOZu0iL._3nPVwR0HZYQah5tkVJHFh5", func(e *colly.HTMLElement) {
-		for _, kw := range config.Keywords {
-			if strings.Contains(e.Text, kw) {
-				filteredProperties <- e.Request.URL.String()
-				break
-			}
-		}
-	})
-
-	c.OnResponse(func(r *colly.Response) {
-		if progressBar != nil {
-			progressBar.Increment()
-		}
-		visitWg.Done()
-	})
-
-	for propertyUrl := range propertyUrls {
-		fullPropertyUrl := rootUrl + propertyUrl
-		visitWg.Add(1)
-		if err := c.Visit(fullPropertyUrl); err != nil {
-			// e.g., ErrAlreadyVisited – callbacks won't fire, so decrement here
-			if progressBar != nil {
-				progressBar.Increment()
-			}
-			visitWg.Done()
+	if payload.ResultCount != "" {
+		if v, err := strconv.Atoi(payload.ResultCount); err == nil {
+			propertyResultCount = uint32(v)
 		}
 	}
 
-	visitWg.Wait()
-	log.Printf("Filter worker finished processing all property URLs")
-}
-
-func getMetadataFromProperties(propertyMetadata chan Property, filteredProperties <-chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	var getDataWg sync.WaitGroup
-
-	c := createCollector()
-	// Ensure we decrement getDataWg on failures too
-	c.OnError(func(r *colly.Response, err error) {
-		getDataWg.Done()
-	})
-	c.OnHTML(".WJG_W7faYk84nW-6sCBVi", func(e *colly.HTMLElement) {
-		var p Property
-		p.Url = e.Request.URL.String()
-
-		p.Street = e.DOM.Find("[itemprop=streetAddress]").First().Text()
-
-		// Extract key facts from the info reel by reading the label in each row
-		infoReel := e.DOM.Find("[data-test=infoReel]#info-reel")
-		infoReel.Find("dl > div").Each(func(_ int, s *goquery.Selection) {
-			// Label is inside dt > span (ignore tooltip content)
-			label := strings.TrimSpace(s.Find("dt span").First().Text())
-			// Prefer dd > p value if present; fall back to dd text then spans/text
-			value := strings.TrimSpace(s.Find("dd p").First().Text())
-			if value == "" {
-				value = strings.TrimSpace(s.Find("dd").First().Text())
-			}
-			if value == "" {
-				value = strings.TrimSpace(s.Find("span").Last().Text())
-			}
-			if value == "" {
-				value = strings.TrimSpace(s.Text())
-			}
-
-			switch strings.ToUpper(label) {
-			case "PROPERTY TYPE":
-				p.PropertyType = value
-			case "BEDROOMS":
-				bedsText := value
-				if isUnknownValue(bedsText) {
-					p.Beds = 0
-				} else {
-					beds, err := strconv.Atoi(bedsText)
-					if err != nil {
-						log.Printf("Could not parse bedrooms - received value: '%s', error: %v, setting to 0, url: %s", bedsText, err, p.Url)
-						p.Beds = 0
-					} else {
-						p.Beds = beds
-					}
-				}
-			case "BATHROOMS":
-				bathsText := value
-				if isUnknownValue(bathsText) {
-					p.Baths = 0
-				} else {
-					baths, err := strconv.Atoi(bathsText)
-					if err != nil {
-						log.Printf("Could not parse bathrooms - received value: '%s', error: %v, setting to 0, url: %s", bathsText, err, p.Url)
-						p.Baths = 0
-					} else {
-						p.Baths = baths
-					}
-				}
-			case "SIZE":
-				sizeString := value
-				if strings.Contains(sizeString, " sq m") {
-					sizeText := strings.Split(sizeString, " sq m")[0]
-					size, err := strconv.Atoi(sizeText)
-					if err != nil {
-						log.Printf("Could not parse surface area - raw value: '%s', extracted: '%s', error: %v, setting to 0, url: %s", sizeString, sizeText, err, p.Url)
-						p.Size = 0
-					} else {
-						p.Size = size
-					}
-				} else if isUnknownValue(sizeString) {
-					p.Size = 0
-				} else {
-					// Best-effort: strip non-digits to get a number if present
-					var digits strings.Builder
-					for _, r := range sizeString {
-						if r >= '0' && r <= '9' {
-							digits.WriteRune(r)
-						}
-					}
-					if digits.Len() > 0 {
-						if size, err := strconv.Atoi(digits.String()); err == nil {
-							p.Size = size
-							return
-						}
-					}
-					log.Printf("Surface area in unexpected format - received value: '%s', setting to 0, url: %s", sizeString, p.Url)
-					p.Size = 0
-				}
-			case "TENURE":
-				p.Tenure = value
-			}
-		})
-
-		// Price extraction with robust fallbacks
-		priceText := strings.TrimSpace(e.DOM.Find("div._1gfnqJ3Vtd1z40MlC0MzXu").Find("span").First().Text())
-		if priceText == "" {
-			priceText = strings.TrimSpace(e.DOM.Find("div._1gfnqJ3Vtd1z40MlC0MzXu").First().Text())
-		}
-		if priceText == "" {
-			priceText = strings.TrimSpace(e.DOM.Find("article._2fFy6nQs_hX4a6WEDR-B-6 div._1gfnqJ3Vtd1z40MlC0MzXu").First().Text())
-		}
-		p.Price = parsePrice(priceText, p.Url)
-
-		propertyMetadata <- p
-	})
-
-	c.OnResponse(func(r *colly.Response) { getDataWg.Done() })
-
-	for propertyUrl := range filteredProperties {
-		getDataWg.Add(1)
-		if err := c.Visit(propertyUrl); err != nil {
-			// e.g., ErrAlreadyVisited – callbacks won't fire, so decrement here
-			getDataWg.Done()
-		}
+	if len(payload.Pagination.Options) > 0 {
+		pageCount = uint32(len(payload.Pagination.Options))
+	} else if payload.Pagination.Total > 0 {
+		pageCount = (propertyResultCount + pageLength - 1) / pageLength
+	} else if propertyResultCount > 0 {
+		pageCount = (propertyResultCount + pageLength - 1) / pageLength
 	}
 
-	getDataWg.Wait()
+	log.Printf("Found %d total results across %d pages", propertyResultCount, pageCount)
 }
 
 func setMetadata() {
@@ -394,59 +179,15 @@ func main() {
 	progressBar = NewProgressBar(propertyResultCount)
 	progressBar.Draw()
 
-	propertyUrls := make(chan string, int(pageCount))
-	filteredProperties := make(chan string, int(propertyResultCount))
-	propertyMetadata := make(chan Property, int(propertyResultCount))
-	metaDone := make(chan struct{})
-
-	// Limit concurrent workers to reduce load on Rightmove
-	maxWorkers := intMin(3, int(propertyResultCount))
-
-	var filterWg sync.WaitGroup
-	var metaWg sync.WaitGroup
-
-	// Limited concurrent filter workers
-	for i := 0; i < maxWorkers; i++ {
-		filterWg.Add(1)
-		go filterProperties(filteredProperties, propertyUrls, &filterWg)
-	}
-
-	// Limited concurrent metadata workers
-	for i := 0; i < maxWorkers; i++ {
-		metaWg.Add(1)
-		go getMetadataFromProperties(propertyMetadata, filteredProperties, &metaWg)
-	}
-
-	// Process pages sequentially to avoid overwhelming the server
-	go func() {
-		for i := uint32(0); i < pageCount; i++ {
-			findProperties(i*pageLength, propertyUrls, nil)
-			// Add delay between pages
-			time.Sleep(2 * time.Second)
-		}
-		close(propertyUrls)
-		log.Println("Finished processing all pages, closed propertyUrls channel")
-	}()
-
-	// Close filteredProperties after all filter workers finish
-	go func() {
-		filterWg.Wait()
-		close(filteredProperties)
-		log.Println("All filter workers finished, closed filteredProperties channel")
-	}()
-
-	// Close propertyMetadata after all metadata workers finish
-	go func() {
-		metaWg.Wait()
-		close(propertyMetadata)
-		log.Println("All metadata workers finished, closed propertyMetadata channel")
-		close(metaDone)
-	}()
-
-	// Collect metadata entries into memory
 	var properties []Property
-	for p := range propertyMetadata {
-		properties = append(properties, p)
+	for i := uint32(0); i < pageCount; i++ {
+		pageIndex := i * pageLength
+		pageProps, err := fetchPropertiesPage(pageIndex)
+		if err != nil {
+			log.Printf("Failed to fetch page at index %d: %v", pageIndex, err)
+			continue
+		}
+		properties = append(properties, pageProps...)
 	}
 
 	// Write to CSV after scraping completes
@@ -464,6 +205,97 @@ func main() {
 	} else {
 		fmt.Printf("\nResults CSV: %s\n", filepath.Join(cwd, csvPath))
 	}
+}
+
+// fetchPropertiesPage fetches a search page from the API, updates the progress bar for
+// each property in the response, applies keyword filtering (if any), and returns
+// the matched properties mapped to our Property struct.
+func fetchPropertiesPage(index uint32) ([]Property, error) {
+	url := genUrl(index)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Provide reasonable headers to mimic a browser
+	req.Header.Set("User-Agent", userAgentList[rand.Intn(len(userAgentList))])
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var payload struct {
+		Properties []struct {
+			DisplayAddress              string `json:"displayAddress"`
+			PropertyUrl                 string `json:"propertyUrl"`
+			Bedrooms                    int    `json:"bedrooms"`
+			Bathrooms                   int    `json:"bathrooms"`
+			PropertyTypeFullDescription string `json:"propertyTypeFullDescription"`
+			DisplaySize                 string `json:"displaySize"`
+			Summary                     string `json:"summary"`
+			Price                       struct {
+				Amount int `json:"amount"`
+			} `json:"price"`
+			Tenure struct {
+				TenureType string `json:"tenureType"`
+			} `json:"tenure"`
+		} `json:"properties"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+
+	var matched []Property
+	for _, pr := range payload.Properties {
+		if progressBar != nil {
+			progressBar.Increment()
+		}
+		// Apply keyword filter (case-insensitive) over summary text
+		if len(config.Keywords) > 0 {
+			if !containsAny(strings.ToLower(pr.Summary), config.Keywords) {
+				continue
+			}
+		}
+		var p Property
+		p.Url = rootUrl + pr.PropertyUrl
+		p.Street = sanitizeAddress(pr.DisplayAddress)
+		p.PropertyType = pr.PropertyTypeFullDescription
+		p.Beds = pr.Bedrooms
+		p.Baths = pr.Bathrooms
+		// Parse size best-effort from displaySize
+		if pr.DisplaySize != "" {
+			var digits strings.Builder
+			for _, r := range pr.DisplaySize {
+				if r >= '0' && r <= '9' {
+					digits.WriteRune(r)
+				}
+			}
+			if digits.Len() > 0 {
+				if v, err := strconv.Atoi(digits.String()); err == nil {
+					p.Size = v
+				}
+			}
+		}
+		p.Tenure = pr.Tenure.TenureType
+		p.Price = pr.Price.Amount
+		matched = append(matched, p)
+	}
+
+	return matched, nil
+}
+
+// containsAny returns true if haystack contains any of the keywords (case-insensitive).
+func containsAny(haystack string, keywords []string) bool {
+	hat := strings.ToLower(haystack)
+	for _, kw := range keywords {
+		if strings.Contains(hat, strings.ToLower(strings.TrimSpace(kw))) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeCSV(path string, properties []Property) error {
@@ -500,53 +332,24 @@ func writeCSV(path string, properties []Property) error {
 	return w.Error()
 }
 
-func intMin(a, b int) int {
-	if a < b {
-		return a
+// sanitizeAddress removes newlines and collapses excess whitespace in addresses.
+func sanitizeAddress(text string) string {
+	if text == "" {
+		return text
 	}
-	return b
-}
-
-// parsePrice converts a currency string like "£325,000" or "Guide Price £325,000" into an integer 325000.
-func parsePrice(text string, url string) int {
-	text = strings.TrimSpace(text)
-	if text == "" || isUnknownValue(text) {
-		return 0
-	}
-
-	var digits strings.Builder
-	for _, r := range text {
-		if r >= '0' && r <= '9' {
-			digits.WriteRune(r)
-		}
-	}
-
-	if digits.Len() == 0 {
-		return 0
-	}
-
-	valueString := digits.String()
-	value, err := strconv.Atoi(valueString)
-	if err != nil {
-		log.Printf("Could not parse price - raw value: '%s', extracted: '%s', error: %v, setting to 0, url: %s", text, valueString, err, url)
-		return 0
-	}
-
-	return value
+	// Replace line breaks and tabs with spaces
+	t := strings.ReplaceAll(text, "\r\n", " ")
+	t = strings.ReplaceAll(t, "\n", " ")
+	t = strings.ReplaceAll(t, "\r", " ")
+	t = strings.ReplaceAll(t, "\t", " ")
+	// Collapse multiple spaces and trim
+	parts := strings.Fields(t)
+	return strings.Join(parts, " ")
 }
 
 // isUnknownValue returns true for placeholders used by the site like
 // "Ask agent" or "Ask developer".
 func isUnknownValue(text string) bool {
 	t := strings.TrimSpace(strings.ToLower(text))
-	if t == "" {
-		return true
-	}
-	if t == strings.ToLower(askAgent) {
-		return true
-	}
-	if t == strings.ToLower(askDeveloper) {
-		return true
-	}
-	return false
+	return t == "" || t == "ask agent" || t == "ask developer"
 }
