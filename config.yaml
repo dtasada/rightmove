@@ -1,6 +1,8 @@
 zipCode: SR2 7SB
 radius: 10
-minBedrooms: 5
+minBedrooms: 6
+tenure: 
+  - Freehold
 keywords:
   - self-contained
   - self contained

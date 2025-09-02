@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,7 @@ var (
 		Radius      float32  `yaml:"radius"`
 		MinBedrooms int      `yaml:"minBedrooms"`
 		Keywords    []string `yaml:"keywords"`
+		Tenure      []string `yaml:"tenure"`
 	}
 )
 
@@ -57,9 +59,25 @@ type Property struct {
 
 // Search "Self contained flat" in the description
 
+// validateTenure checks if all tenure values are valid and returns an error if not
+func validateTenure(tenures []string) error {
+	validTenures := map[string]bool{
+		"FREEHOLD":          true,
+		"LEASEHOLD":         true,
+		"SHARE_OF_FREEHOLD": true,
+	}
+
+	for _, tenure := range tenures {
+		if !validTenures[strings.ToUpper(tenure)] {
+			return fmt.Errorf("invalid tenure value: %s. Valid values are: FREEHOLD, LEASEHOLD, SHARE_OF_FREEHOLD", tenure)
+		}
+	}
+	return nil
+}
+
 // genSearchUrl generates the Rightmove API search URL.
 func genUrl(index uint32) string {
-	return rootUrl +
+	baseUrl := rootUrl +
 		"/api/property-search/listing/search" +
 		fmt.Sprintf("?searchLocation=%s", arguments.zipCodeUrl) +
 		"&useLocationIdentifier=true" +
@@ -73,6 +91,19 @@ func genUrl(index uint32) string {
 		"&channel=BUY" +
 		"&transactionType=BUY" +
 		"&displayLocationIdentifier=undefined"
+
+	// Add tenure types if specified
+	if len(config.Tenure) > 0 {
+		// Convert tenure values to uppercase and URL encode them
+		var tenureValues []string
+		for _, tenure := range config.Tenure {
+			tenureValues = append(tenureValues, strings.ToUpper(tenure))
+		}
+		tenureParam := url.QueryEscape(strings.Join(tenureValues, ","))
+		baseUrl += fmt.Sprintf("&tenureTypes=%s", tenureParam)
+	}
+
+	return baseUrl
 }
 
 func getPropertyCount() {
@@ -159,6 +190,13 @@ func main() {
 		log.Fatalf("Could not parse config.yaml: %v\n", err)
 	}
 
+	// Validate tenure values if provided
+	if len(config.Tenure) > 0 {
+		if err := validateTenure(config.Tenure); err != nil {
+			log.Fatalf("Configuration error: %v\n", err)
+		}
+	}
+
 	// Print a concise bullet list of the search conditions to stdout
 	fmt.Println()
 	fmt.Println("Search:")
@@ -166,6 +204,9 @@ func main() {
 	fmt.Printf("- radius: %.1fmi\n", config.Radius)
 	fmt.Printf("- minBeds: %d\n", config.MinBedrooms)
 	fmt.Printf("- keywords: %s\n", strings.Join(config.Keywords, ", "))
+	if len(config.Tenure) > 0 {
+		fmt.Printf("- tenure: %s\n", strings.Join(config.Tenure, ", "))
+	}
 	fmt.Println()
 
 	setMetadata()
