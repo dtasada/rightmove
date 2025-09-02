@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	pageLength uint32 = 24
-	rootUrl    string = "https://www.rightmove.co.uk"
-	askAgent   string = "Ask agent"
+	pageLength   uint32 = 24
+	rootUrl      string = "https://www.rightmove.co.uk"
+	askAgent     string = "Ask agent"
+	askDeveloper string = "Ask developer"
 )
 
 var (
@@ -135,7 +136,7 @@ func getPropertyCount() {
 				pageCountText := after
 				pageCountValue, err := strconv.Atoi(pageCountText)
 				if err != nil {
-					log.Printf("Could not parse page count from 'of %s', error: %v", pageCountText, err)
+					log.Printf("Could not parse page count from 'of %s', error: %v, url: %s", pageCountText, err, e.Request.URL.String())
 					return
 				}
 				pageCount = uint32(pageCountValue)
@@ -230,58 +231,84 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 
 		p.Street = e.DOM.Find("[itemprop=streetAddress]").First().Text()
 
-		e.DOM.Find("._1hV1kqpVceE9m-QrX_hWDN").Each(func(i int, s *goquery.Selection) {
-			switch i {
-			case 0:
-				p.PropertyType = s.Text()
-			case 1:
-				bedsText := s.Text()
-				if bedsText == askAgent {
-					// Expected case where bedrooms info is not available
+		// Extract key facts from the info reel by reading the label in each row
+		infoReel := e.DOM.Find("[data-test=infoReel]#info-reel")
+		infoReel.Find("dl > div").Each(func(_ int, s *goquery.Selection) {
+			// Label is inside dt > span (ignore tooltip content)
+			label := strings.TrimSpace(s.Find("dt span").First().Text())
+			// Prefer dd > p value if present; fall back to dd text then spans/text
+			value := strings.TrimSpace(s.Find("dd p").First().Text())
+			if value == "" {
+				value = strings.TrimSpace(s.Find("dd").First().Text())
+			}
+			if value == "" {
+				value = strings.TrimSpace(s.Find("span").Last().Text())
+			}
+			if value == "" {
+				value = strings.TrimSpace(s.Text())
+			}
+
+			switch strings.ToUpper(label) {
+			case "PROPERTY TYPE":
+				p.PropertyType = value
+			case "BEDROOMS":
+				bedsText := value
+				if isUnknownValue(bedsText) {
 					p.Beds = 0
 				} else {
 					beds, err := strconv.Atoi(bedsText)
 					if err != nil {
-						log.Printf("Could not parse bedrooms - received value: '%s', error: %v, setting to 0", bedsText, err)
+						log.Printf("Could not parse bedrooms - received value: '%s', error: %v, setting to 0, url: %s", bedsText, err, p.Url)
 						p.Beds = 0
 					} else {
 						p.Beds = beds
 					}
 				}
-			case 2:
-				bathsText := s.Text()
-				if bathsText == askAgent {
-					// Expected case where bathrooms info is not available
+			case "BATHROOMS":
+				bathsText := value
+				if isUnknownValue(bathsText) {
 					p.Baths = 0
 				} else {
 					baths, err := strconv.Atoi(bathsText)
 					if err != nil {
-						log.Printf("Could not parse bathrooms - received value: '%s', error: %v, setting to 0", bathsText, err)
+						log.Printf("Could not parse bathrooms - received value: '%s', error: %v, setting to 0, url: %s", bathsText, err, p.Url)
 						p.Baths = 0
 					} else {
 						p.Baths = baths
 					}
 				}
-			case 3:
-				sizeString := s.Parent().Children().Last().Text()
+			case "SIZE":
+				sizeString := value
 				if strings.Contains(sizeString, " sq m") {
 					sizeText := strings.Split(sizeString, " sq m")[0]
 					size, err := strconv.Atoi(sizeText)
 					if err != nil {
-						log.Printf("Could not parse surface area - raw value: '%s', extracted: '%s', error: %v, setting to 0", sizeString, sizeText, err)
+						log.Printf("Could not parse surface area - raw value: '%s', extracted: '%s', error: %v, setting to 0, url: %s", sizeString, sizeText, err, p.Url)
 						p.Size = 0
 					} else {
 						p.Size = size
 					}
-				} else if sizeString == askAgent {
-					// Expected cases where size is not available
+				} else if isUnknownValue(sizeString) {
 					p.Size = 0
 				} else {
-					log.Printf("Surface area in unexpected format - received value: '%s', setting to 0", sizeString)
+					// Best-effort: strip non-digits to get a number if present
+					var digits strings.Builder
+					for _, r := range sizeString {
+						if r >= '0' && r <= '9' {
+							digits.WriteRune(r)
+						}
+					}
+					if digits.Len() > 0 {
+						if size, err := strconv.Atoi(digits.String()); err == nil {
+							p.Size = size
+							return
+						}
+					}
+					log.Printf("Surface area in unexpected format - received value: '%s', setting to 0, url: %s", sizeString, p.Url)
 					p.Size = 0
 				}
-			case 4:
-				p.Tenure = s.Text()
+			case "TENURE":
+				p.Tenure = value
 			}
 		})
 
@@ -293,7 +320,7 @@ func getMetadataFromProperties(propertyMetadata chan Property, filteredPropertie
 		if priceText == "" {
 			priceText = strings.TrimSpace(e.DOM.Find("article._2fFy6nQs_hX4a6WEDR-B-6 div._1gfnqJ3Vtd1z40MlC0MzXu").First().Text())
 		}
-		p.Price = parsePrice(priceText)
+		p.Price = parsePrice(priceText, p.Url)
 
 		propertyMetadata <- p
 	})
@@ -481,9 +508,9 @@ func intMin(a, b int) int {
 }
 
 // parsePrice converts a currency string like "£325,000" or "Guide Price £325,000" into an integer 325000.
-func parsePrice(text string) int {
+func parsePrice(text string, url string) int {
 	text = strings.TrimSpace(text)
-	if text == "" || text == askAgent {
+	if text == "" || isUnknownValue(text) {
 		return 0
 	}
 
@@ -501,9 +528,25 @@ func parsePrice(text string) int {
 	valueString := digits.String()
 	value, err := strconv.Atoi(valueString)
 	if err != nil {
-		log.Printf("Could not parse price - raw value: '%s', extracted: '%s', error: %v, setting to 0", text, valueString, err)
+		log.Printf("Could not parse price - raw value: '%s', extracted: '%s', error: %v, setting to 0, url: %s", text, valueString, err, url)
 		return 0
 	}
 
 	return value
+}
+
+// isUnknownValue returns true for placeholders used by the site like
+// "Ask agent" or "Ask developer".
+func isUnknownValue(text string) bool {
+	t := strings.TrimSpace(strings.ToLower(text))
+	if t == "" {
+		return true
+	}
+	if t == strings.ToLower(askAgent) {
+		return true
+	}
+	if t == strings.ToLower(askDeveloper) {
+		return true
+	}
+	return false
 }
